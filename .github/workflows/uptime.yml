@@ -1,0 +1,145 @@
+name: uptime
+
+# Внешняя проверка доступности https://oplix.ru/ раз в 5 минут.
+# Состояние («упал с …», «последнее сообщение в …») между запусками
+# хранится в кэше Actions: новая запись только при изменении,
+# чтение — самая свежая запись по префиксу ключа.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      test:
+        description: 'Отправить тестовое сообщение в Telegram'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Restore state
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .uptime-state
+          key: uptime-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: uptime-state-
+
+      - name: Check and notify
+        id: check
+        env:
+          BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TEST: ${{ inputs.test }}
+        run: |
+          set +e -u
+          URL='https://oplix.ru/'
+          SITE='oplix.ru'
+          STATE_DIR=.uptime-state
+          STATE="$STATE_DIR/state"
+          REMIND_SEC=3600
+          now=$(date -u +%s)
+          fail=0
+          changed=false
+
+          # --- состояние прошлого запуска ---
+          prev=unknown; down_since=0; last_alert=0
+          if [ -f "$STATE" ]; then
+            while IFS='=' read -r k v; do
+              case "$k" in
+                status) [ "$v" = up ] || [ "$v" = down ] && prev="$v" ;;
+                down_since) [[ "$v" =~ ^[0-9]+$ ]] && down_since="$v" ;;
+                last_alert) [[ "$v" =~ ^[0-9]+$ ]] && last_alert="$v" ;;
+              esac
+            done < "$STATE"
+            echo "state: $prev down_since=$down_since last_alert=$last_alert"
+          else
+            echo "state: нет (первый запуск или кэш недоступен)"
+          fi
+
+          save_state() {
+            mkdir -p "$STATE_DIR"
+            printf 'status=%s\ndown_since=%s\nlast_alert=%s\n' "$1" "$2" "$3" > "$STATE"
+            changed=true
+          }
+
+          # Отправка в Telegram. В лог — только ok / не ok.
+          tg() {
+            if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+              echo "telegram: НЕ ok (нет секретов)"; return 1
+            fi
+            local resp rc=0
+            resp=$(curl -s --max-time 20 --retry 2 --retry-delay 3 -K - \
+                     --data-urlencode "text=$1" \
+                     --data-urlencode 'disable_web_page_preview=true' <<EOF
+          url = "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+          data-urlencode = "chat_id=${CHAT_ID}"
+          EOF
+            ) || rc=$?
+            if [ "$rc" -eq 0 ] && printf '%s' "$resp" | grep -q '"ok":true'; then
+              echo "telegram: ok"; return 0
+            fi
+            echo "telegram: НЕ ok (curl exit $rc)"; return 1
+          }
+
+          if [ "${TEST:-false}" = "true" ]; then
+            tg '🧪 Тест: внешний сторож oplix.ru (GitHub) подключён' || fail=1
+          fi
+
+          # --- проверка: до 3 попыток, пауза 20 с; «жив» = HTTP 200 ---
+          status=down
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -L --max-redirs 3 --connect-timeout 10 \
+                     --max-time 20 -w '%{http_code}' "$URL") || true
+            echo "попытка $i: HTTP ${code:-000}"
+            if [ "$code" = "200" ]; then status=up; break; fi
+            [ "$i" -lt 3 ] && sleep 20
+          done
+          echo "итог: $status"
+
+          if [ "$status" = up ]; then
+            if [ "$prev" = down ]; then
+              if [ "$last_alert" -gt 0 ]; then
+                mins=$(( (now - down_since + 59) / 60 ))
+                if tg "✅ ${SITE} снова отвечает, простой ≈${mins} мин"; then
+                  save_state up 0 0
+                else
+                  fail=1   # состояние «упал» остаётся — повтор в следующий запуск
+                fi
+              else
+                save_state up 0 0   # о падении сообщить не удалось — молча сбрасываем
+              fi
+            fi
+          else
+            [ "$prev" = down ] && [ "$down_since" -gt 0 ] || { down_since=$now; last_alert=0; changed=true; }
+            if [ "$last_alert" -eq 0 ]; then
+              msg="🔴 ${SITE} не отвечает (внешняя проверка с GitHub, вне Timeweb)"
+            elif [ $(( now - last_alert )) -ge "$REMIND_SEC" ]; then
+              mins=$(( (now - down_since + 59) / 60 ))
+              msg="🔴 ${SITE} всё ещё не отвечает, ≈${mins} мин (внешняя проверка с GitHub, вне Timeweb)"
+            else
+              msg=''
+            fi
+            if [ -n "$msg" ]; then
+              if tg "$msg"; then last_alert=$now; changed=true; else fail=1; fi
+            fi
+            [ "$changed" = true ] && save_state down "$down_since" "$last_alert"
+          fi
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          exit "$fail"
+
+      - name: Save state
+        if: always() && steps.check.outputs.changed == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .uptime-state
+          key: uptime-state-${{ github.run_id }}-${{ github.run_attempt }}

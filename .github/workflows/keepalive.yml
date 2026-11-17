@@ -1,0 +1,43 @@
+name: keepalive
+
+# GitHub отключает расписание в открытых репозиториях после 60 дней без
+# активности. Два раза в месяц: (1) включаем оба workflow через API
+# (это сбрасывает счётчик неактивности), (2) пустой коммит в служебную
+# ветку keepalive (активность репозитория; ветка main не меняется).
+
+on:
+  schedule:
+    - cron: '23 7 1,15 * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Enable workflows and touch keepalive branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          rc=0
+          for wf in uptime.yml keepalive.yml; do
+            if gh api -X PUT "repos/$REPO/actions/workflows/$wf/enable" >/dev/null; then
+              echo "enable $wf: ok"
+            else
+              echo "enable $wf: НЕ ok"; rc=1
+            fi
+          done
+          head=$(gh api "repos/$REPO/git/ref/heads/keepalive" --jq .object.sha)
+          tree=$(gh api "repos/$REPO/git/commits/$head" --jq .tree.sha)
+          new=$(gh api -X POST "repos/$REPO/git/commits" \
+                  -f message="keepalive $(date -u +%F)" \
+                  -f tree="$tree" -f "parents[]=$head" --jq .sha)
+          gh api -X PATCH "repos/$REPO/git/refs/heads/keepalive" -f sha="$new" >/dev/null
+          echo "keepalive branch: $new"
+          exit "$rc"
